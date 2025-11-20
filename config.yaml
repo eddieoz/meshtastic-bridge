@@ -1,0 +1,51 @@
+devices:
+  - name: t_echo
+    serial: /dev/ttyACM0
+mqtt_servers:
+  - name: external
+    server: 192.168.0.120
+    port: 1883
+    topic: meshtastic/radio
+#    pipelines:
+#      mqtt-to-radio:
+#        - radio_message_plugin:
+#            device: t_echo
+#            to: "^all"
+pipelines:
+  pipeline1:
+    - debugger:
+        log_level: debug
+  radio-to-mqtt:
+    # Store & Forward Plugin - MUST run BEFORE message_filter
+    # so it can detect when filtered nodes come online
+    - store_forward_plugin:
+        storage_path: ./data/store_forward.db  # or ./store_forward.db
+        device: t_echo
+        ttl_hours: 48
+        delivered_retention_hours: 2
+        max_messages_per_node: 500
+        log_level: debug
+        store_broadcasts: true  # Store broadcast/channel messages too
+        # Filter which nodes to store/forward messages for
+        to:  # Filter by destination node
+          allow:  # Store messages FOR these nodes (broadcasts will be delivered to them)
+            - "1119572084"   # !42bb5074 - your radio
+            - "2131711769"   # !7f0f5719 - wife's radio
+            - "2071429491"   # !7b778173 - another radio
+          # disallow:  # Never store messages TO these nodes
+          #   - "!blockednode"
+        # from:  # Filter by sender node
+        #   allow:  # Only store messages FROM these nodes
+        #     - "!trustednode1"
+        #   disallow:  # Never store messages FROM these nodes
+        #     - "!spamnode"
+    - message_filter:  # Filter AFTER store_forward processes the packet
+       from:
+         disallow:
+           - "!5af47b5e"
+    - timestamp_plugin:          # Add timestamp here
+        format: unix             # or unix_ms, iso, iso_local
+        field: timestamp         # optional, defaults to "timestamp"
+    - mqtt_plugin:
+        name: external
+        topic: meshtastic/radio

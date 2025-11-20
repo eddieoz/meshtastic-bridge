@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  meshtastic-bridge:
+    build: .
+    image: meshtastic-bridge:local
+    container_name: meshtastic-bridge
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - ./config.yaml:/code/config.yaml:ro
+      - ./data:/code/data  # Mount data directory for store & forward database
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  telegraf:
+    image: telegraf:latest
+    container_name: telegraf
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - INFLUX_TOKEN=${INFLUX_TOKEN}
+    command: >
+      telegraf --config http://192.168.0.120:8086/api/v2/telegrafs/0fb959f7cfa71000
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
