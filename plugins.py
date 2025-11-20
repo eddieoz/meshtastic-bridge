@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import ssl
+import time
 
 plugins = {}
 
@@ -95,6 +97,11 @@ class MessageFilter(Plugin):
             self.logger.error("Missing packet")
             return packet
 
+        # Skip filtering encrypted packets - they need to be decrypted first
+        if "decoded" not in packet:
+            self.logger.debug("Skipping filter for encrypted/undecoded packet")
+            return packet
+
         text = packet["decoded"]["text"] if "text" in packet["decoded"] else None
 
         if text and "message" in self.config:
@@ -123,13 +130,13 @@ class MessageFilter(Plugin):
                     return None
 
         filters = {
-            "app": packet["decoded"]["portnum"],
-            "from": packet["fromId"],
-            "to": packet["toId"],
+            "app": packet["decoded"]["portnum"] if "portnum" in packet["decoded"] else None,
+            "from": packet["fromId"] if "fromId" in packet else None,
+            "to": packet["toId"] if "toId" in packet else None,
         }
 
         for filter_key, value in filters.items():
-            if filter_key in self.config:
+            if filter_key in self.config and value is not None:
                 filter_val = self.config[filter_key]
 
                 if (
@@ -616,3 +623,735 @@ class NoStrPlugin(Plugin):
 
 
 plugins["nostr_plugin"] = NoStrPlugin()
+
+
+class TimestampPlugin(Plugin):
+    logger = logging.getLogger(name="meshtastic.bridge.plugin.timestamp")
+
+    def do_action(self, packet):
+        import time
+        from datetime import datetime
+
+        # Default field name
+        field_name = self.config.get("field", "timestamp") if self.config else "timestamp"
+
+        # Default format is unix epoch
+        format_type = self.config.get("format", "unix") if self.config else "unix"
+
+        if format_type == "unix":
+            timestamp = int(time.time())
+        elif format_type == "unix_ms":
+            timestamp = int(time.time() * 1000)
+        elif format_type == "iso":
+            timestamp = datetime.utcnow().isoformat() + "Z"
+        elif format_type == "iso_local":
+            timestamp = datetime.now().isoformat()
+        else:
+            self.logger.warning(f"Unknown format type: {format_type}, using unix")
+            timestamp = int(time.time())
+
+        # Add timestamp to packet at top level
+        if isinstance(packet, dict):
+            packet[field_name] = timestamp
+            self.logger.debug(f"Added timestamp: {field_name}={timestamp}")
+        else:
+            self.logger.warning("Packet is not a dict, cannot add timestamp")
+
+        return packet
+
+
+plugins["timestamp_plugin"] = TimestampPlugin()
+
+
+class StoreForwardPlugin(Plugin):
+    """
+    Store & Forward Plugin - Aggressive Mode
+
+    Stores ALL directed messages and automatically delivers them when destination
+    nodes are in range. This ensures messages are never lost due to nodes being
+    out of range, even if they appear recently active.
+
+    Features:
+    - Stores all directed messages (not just for offline nodes)
+    - Attempts immediate delivery if node was recently seen
+    - Two-tier cleanup: delivered messages (2hr grace) + undelivered (48hr TTL)
+    - Persistent SQLite storage survives bridge restarts
+    """
+
+    logger = logging.getLogger(name="meshtastic.bridge.plugin.store_forward")
+
+    def __init__(self):
+        super().__init__()
+        self.db = None
+        self.device_ref = None
+        self.packet_count = 0  # For periodic cleanup
+        self.configured = False  # Track if already configured
+
+    def configure(self, devices, mqtt_servers, config):
+        """Initialize plugin with configuration (only once)"""
+        # Skip if already configured
+        if self.configured:
+            return
+
+        super().configure(devices, mqtt_servers, config)
+
+        # Validate required configuration
+        if not config or 'storage_path' not in config:
+            raise ValueError("store_forward_plugin requires 'storage_path' configuration")
+
+        if 'device' not in config:
+            raise ValueError("store_forward_plugin requires 'device' configuration")
+
+        # Load configuration with defaults
+        self.storage_path = config['storage_path']
+        self.device_name = config['device']
+        self.ttl_hours = config.get('ttl_hours', 48)
+        self.delivered_retention_hours = config.get('delivered_retention_hours', 2)
+        self.max_messages_per_node = config.get('max_messages_per_node', 500)
+        self.offline_threshold_minutes = config.get('offline_threshold_minutes', 30)
+
+        # Store devices reference for lazy loading
+        self.devices = devices
+        self.device_ref = None
+        self.bridge_node_id = None  # Will be populated when device is available
+
+        # Initialize database
+        self._init_database()
+
+        self.logger.info(f"Store & Forward plugin initialized (Aggressive Mode)")
+        self.logger.info(f"Storage: {self.storage_path}")
+        self.logger.info(f"TTL: {self.ttl_hours}h, Grace period: {self.delivered_retention_hours}h")
+        self.logger.info(f"Max messages per node: {self.max_messages_per_node}")
+
+        self.configured = True
+
+    def _init_database(self):
+        """Initialize SQLite database with schema"""
+        try:
+            self.db = sqlite3.connect(self.storage_path, check_same_thread=False)
+            cursor = self.db.cursor()
+
+            # Create messages table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    to_node TEXT NOT NULL,
+                    from_node TEXT NOT NULL,
+                    packet_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    delivered INTEGER DEFAULT 0,
+                    delivered_at INTEGER
+                )
+            """)
+
+            # Create indexes for efficient queries
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_to_node
+                ON messages(to_node)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_delivered
+                ON messages(delivered)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_delivered_at
+                ON messages(delivered_at)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_expires
+                ON messages(expires_at)
+            """)
+
+            # Create node_presence table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS node_presence (
+                    node_id TEXT PRIMARY KEY,
+                    last_seen INTEGER NOT NULL,
+                    status TEXT DEFAULT 'unknown'
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_node_presence_last_seen
+                ON node_presence(last_seen)
+            """)
+
+            self.db.commit()
+
+            # Log database stats
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE delivered=0")
+            undelivered = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM node_presence")
+            nodes = cursor.fetchone()[0]
+
+            self.logger.info(f"Database initialized: {undelivered} undelivered messages, {nodes} tracked nodes")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to initialize database: {e}")
+            raise
+
+    def _extract_node_id(self, packet, field):
+        """
+        Extract node ID from packet field ('from' or 'to')
+        Handles both integer and hex string formats (e.g., '!bd5ba0ec')
+        """
+        if not packet or not isinstance(packet, dict):
+            return None
+
+        # Try both field and field + 'Id' variants
+        node_id = packet.get(field) or packet.get(field + 'Id')
+
+        if node_id is None:
+            return None
+
+        # Convert to string for consistent storage
+        return str(node_id)
+
+    def _update_node_presence(self, node_id):
+        """Update last-seen timestamp for a node"""
+        if not node_id:
+            return
+
+        try:
+            now = int(time.time())
+            cursor = self.db.cursor()
+
+            # Insert or update node presence
+            cursor.execute("""
+                INSERT INTO node_presence (node_id, last_seen, status)
+                VALUES (?, ?, 'online')
+                ON CONFLICT(node_id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    status = 'online'
+            """, (node_id, now))
+
+            self.db.commit()
+            self.logger.debug(f"Updated presence for node {node_id}")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to update node presence: {e}")
+
+    def _is_node_recently_seen(self, node_id):
+        """
+        Check if node was seen recently (within offline_threshold_minutes)
+        Used for immediate delivery attempts
+        """
+        if not node_id:
+            return False
+
+        try:
+            cursor = self.db.cursor()
+            threshold = int(time.time()) - (self.offline_threshold_minutes * 60)
+
+            cursor.execute("""
+                SELECT last_seen FROM node_presence
+                WHERE node_id = ? AND last_seen >= ?
+            """, (node_id, threshold))
+
+            result = cursor.fetchone()
+            return result is not None
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to check node presence: {e}")
+            return False
+
+    def _check_node_filter(self, node_id, filter_config):
+        """
+        Check if node passes allow/disallow filter
+        Returns True if node should be processed, False otherwise
+        """
+        if not filter_config:
+            return True  # No filter configured, allow all
+
+        # Check disallow list first (takes precedence)
+        if 'disallow' in filter_config:
+            if node_id in filter_config['disallow']:
+                self.logger.debug(f"Node {node_id} is in disallow list")
+                return False
+
+        # Check allow list
+        if 'allow' in filter_config:
+            if node_id in filter_config['allow']:
+                return True
+            else:
+                self.logger.debug(f"Node {node_id} not in allow list")
+                return False
+
+        # No allow list configured, allow by default
+        return True
+
+    def _is_broadcast(self, to_node):
+        """Check if destination is a broadcast address"""
+        return to_node in ['^all', '4294967295', 'ffffffff']
+
+    def _is_deliverable_packet(self, packet):
+        """Check if packet type can be delivered (TEXT or POSITION only)"""
+        if not packet or 'decoded' not in packet:
+            return False
+
+        decoded = packet['decoded']
+        portnum = decoded.get('portnum', '')
+
+        # Only TEXT_MESSAGE_APP and POSITION_APP can be delivered
+        # return portnum in ['TEXT_MESSAGE_APP', 'POSITION_APP']
+        return portnum in ['TEXT_MESSAGE_APP']
+
+    def _should_store_packet(self, packet):
+        """
+        Check if packet should be stored (with optional filtering)
+        Store directed messages and optionally broadcasts
+        """
+        if not packet or not isinstance(packet, dict):
+            return False
+
+        # Only store deliverable packet types (TEXT and POSITION)
+        if not self._is_deliverable_packet(packet):
+            if 'decoded' in packet and 'portnum' in packet['decoded']:
+                self.logger.debug(f"Skipping non-deliverable packet type: {packet['decoded']['portnum']}")
+            return False
+
+        # Get destination node
+        to_node = self._extract_node_id(packet, 'to')
+
+        # Skip if no destination
+        if not to_node:
+            self.logger.debug("Skipping packet without destination")
+            return False
+
+        # Handle broadcasts
+        is_broadcast = self._is_broadcast(to_node)
+        if is_broadcast:
+            # Check if broadcast storage is enabled
+            if not self.config.get('store_broadcasts', False):
+                self.logger.debug(f"Skipping broadcast message (to: {to_node}), broadcast storage disabled")
+                return False
+            # Broadcasts will be stored for all nodes in the allow list
+            self.logger.debug(f"Broadcast message detected, will store for allowed nodes")
+            return True
+
+        # For directed messages: check destination node filter
+        if 'to' in self.config:
+            if not self._check_node_filter(to_node, self.config['to']):
+                self.logger.debug(f"Destination node {to_node} filtered out")
+                return False
+
+        # Check sender node filter
+        from_node = self._extract_node_id(packet, 'from')
+        if from_node and 'from' in self.config:
+            if not self._check_node_filter(from_node, self.config['from']):
+                self.logger.debug(f"Sender node {from_node} filtered out")
+                return False
+
+        # Passed all filters
+        return True
+
+    def _store_packet(self, packet):
+        """Store packet in database for later delivery"""
+        try:
+            to_node = self._extract_node_id(packet, 'to')
+            from_node = self._extract_node_id(packet, 'from')
+
+            if not to_node:
+                return
+
+            # Check if this is a broadcast
+            is_broadcast = self._is_broadcast(to_node)
+
+            # Serialize packet to JSON
+            packet_json = json.dumps(packet)
+
+            # Calculate timestamps
+            now = int(time.time())
+            expires_at = now + (self.ttl_hours * 3600)
+
+            cursor = self.db.cursor()
+
+            if is_broadcast and 'to' in self.config and 'allow' in self.config['to']:
+                # Store broadcast for each node in the allow list
+                allow_list = self.config['to']['allow']
+                stored_count = 0
+
+                for target_node in allow_list:
+                    cursor.execute("""
+                        INSERT INTO messages (to_node, from_node, packet_json, created_at, expires_at, delivered)
+                        VALUES (?, ?, ?, ?, ?, 0)
+                    """, (target_node, from_node or 'unknown', packet_json, now, expires_at))
+                    stored_count += 1
+
+                    # Enforce per-node message limit
+                    self._enforce_node_limit(target_node)
+
+                self.db.commit()
+                self.logger.info(f"Stored broadcast from {from_node} for {stored_count} nodes")
+
+            else:
+                # Store directed message normally
+                cursor.execute("""
+                    INSERT INTO messages (to_node, from_node, packet_json, created_at, expires_at, delivered)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                """, (to_node, from_node or 'unknown', packet_json, now, expires_at))
+
+                message_id = cursor.lastrowid
+                self.db.commit()
+
+                self.logger.info(f"Stored message {message_id}: {from_node} → {to_node}")
+
+                # Enforce per-node message limit
+                self._enforce_node_limit(to_node)
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to store packet: {e}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to serialize packet: {e}")
+
+    def _enforce_node_limit(self, node_id):
+        """Enforce max_messages_per_node limit by removing oldest undelivered messages"""
+        try:
+            cursor = self.db.cursor()
+
+            # Count undelivered messages for this node
+            cursor.execute("""
+                SELECT COUNT(*) FROM messages
+                WHERE to_node = ? AND delivered = 0
+            """, (node_id,))
+
+            count = cursor.fetchone()[0]
+
+            if count > self.max_messages_per_node:
+                # Delete oldest messages beyond limit
+                delete_count = count - self.max_messages_per_node
+                cursor.execute("""
+                    DELETE FROM messages
+                    WHERE id IN (
+                        SELECT id FROM messages
+                        WHERE to_node = ? AND delivered = 0
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                    )
+                """, (node_id, delete_count))
+
+                self.db.commit()
+                self.logger.warning(f"Enforced message limit for node {node_id}: removed {delete_count} oldest messages")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to enforce node limit: {e}")
+
+    def _deliver_stored_messages(self, node_id):
+        """Deliver all stored messages for a node (called when node comes online)"""
+        if not node_id:
+            return
+
+        # Check if device is available
+        if not self._get_device_ref():
+            self.logger.debug(f"Cannot deliver messages, device not yet available")
+            return
+
+        try:
+            cursor = self.db.cursor()
+
+            # Get all undelivered messages for this node (FIFO order)
+            cursor.execute("""
+                SELECT id, packet_json, from_node, created_at
+                FROM messages
+                WHERE to_node = ? AND delivered = 0
+                ORDER BY created_at ASC
+            """, (node_id,))
+
+            messages = cursor.fetchall()
+
+            if not messages:
+                return
+
+            self.logger.info(f"Delivering {len(messages)} stored messages to node {node_id}")
+
+            delivered_count = 0
+            for msg_id, packet_json, from_node, created_at in messages:
+                try:
+                    # Deserialize packet
+                    packet = json.loads(packet_json)
+
+                    # Send message with metadata
+                    if self._send_packet_to_node(packet, node_id, from_node, created_at):
+                        # Mark as delivered
+                        self._mark_delivered(msg_id)
+                        delivered_count += 1
+                        self.logger.info(f"Delivered message {msg_id} to {node_id} from {from_node}")
+                    else:
+                        self.logger.warning(f"Failed to deliver message {msg_id} to {node_id}")
+
+                    # Rate limiting (1 message per second)
+                    time.sleep(1)
+
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Failed to deserialize message {msg_id}: {e}")
+                except Exception as e:
+                    self.logger.error(f"Failed to deliver message {msg_id}: {e}")
+
+            self.logger.info(f"Delivered {delivered_count}/{len(messages)} messages to {node_id}")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to retrieve stored messages: {e}")
+
+    def _get_device_ref(self):
+        """Lazy-load device reference (may not be available at configure time)"""
+        if not self.device_ref and self.device_name in self.devices:
+            self.device_ref = self.devices[self.device_name]
+            self.logger.info(f"Device '{self.device_name}' connected and ready for store & forward")
+
+            # Get bridge node ID
+            try:
+                node_info = self.device_ref.getMyNodeInfo()
+                self.bridge_node_id = str(node_info['num'])
+                self.logger.info(f"Bridge node ID: {self.bridge_node_id}")
+            except Exception as e:
+                self.logger.warning(f"Could not get bridge node ID: {e}")
+
+        return self.device_ref
+
+    def _node_id_to_hex(self, node_id):
+        """Convert node ID (string or int) to hex format (!xxxxxxxx)"""
+        try:
+            node_int = int(node_id)
+            return f"!{node_int:08x}"
+        except (ValueError, TypeError):
+            return str(node_id)
+
+    def _format_timestamp(self, timestamp):
+        """Format unix timestamp to readable string"""
+        from datetime import datetime
+        try:
+            dt = datetime.fromtimestamp(int(timestamp))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            return str(timestamp)
+
+    def _send_packet_to_node(self, packet, node_id, from_node=None, created_at=None):
+        """
+        Send packet to node via device interface
+        Returns True if send successful, False otherwise
+
+        Args:
+            packet: The packet to send
+            node_id: Destination node ID
+            from_node: Original sender (for metadata)
+            created_at: Original timestamp (for metadata)
+        """
+        device = self._get_device_ref()
+        if not device:
+            self.logger.debug(f"Device '{self.device_name}' not yet available for sending")
+            return False
+
+        try:
+            # Convert node_id to integer for Meshtastic API
+            # node_id is stored as string (e.g., "1119572084"), API needs int
+            try:
+                destination_id = int(node_id)
+            except (ValueError, TypeError):
+                self.logger.error(f"Invalid node_id format: {node_id}")
+                return False
+
+            # Extract message content
+            if 'decoded' not in packet:
+                self.logger.warning(f"Packet has no decoded content, skipping")
+                return False
+
+            decoded = packet['decoded']
+
+            # Handle text messages
+            if 'text' in decoded:
+                original_text = decoded['text']
+
+                # Add metadata if this is a stored message
+                if from_node and created_at:
+                    from_hex = self._node_id_to_hex(from_node)
+                    timestamp_str = self._format_timestamp(created_at)
+
+                    # Extract channel (try multiple possible locations)
+                    channel = packet.get('channel')
+                    if channel is None:
+                        channel = decoded.get('channel')
+                    if channel is None:
+                        # Check if it's a channelId field
+                        channel = packet.get('channelId', decoded.get('channelId'))
+
+                    # Debug: log packet keys to help identify channel field
+                    self.logger.debug(f"Packet keys: {list(packet.keys())}")
+
+                    # Format channel display
+                    if channel is not None:
+                        channel_str = f"Channel: {channel}"
+                    else:
+                        channel_str = "Channel: Primary"  # Default assumption
+
+                    # Format message with metadata
+                    text = f"[Stored Message]\nFrom: {from_hex}\nSent: {timestamp_str}\n{channel_str}\n---\n{original_text}"
+                else:
+                    text = original_text
+
+                device.sendText(text=text, destinationId=destination_id)
+                self.logger.info(f"Sent text message to {node_id}: '{original_text}'")
+                return True
+
+            # Handle position messages
+            elif 'position' in decoded:
+                pos = decoded['position']
+                if 'latitude' in pos and 'longitude' in pos:
+                    # For positions, send metadata as separate text message first
+                    if from_node and created_at:
+                        from_hex = self._node_id_to_hex(from_node)
+                        timestamp_str = self._format_timestamp(created_at)
+                        metadata_text = f"[Stored Position]\nFrom: {from_hex}\nSent: {timestamp_str}"
+                        device.sendText(text=metadata_text, destinationId=destination_id)
+                        time.sleep(1)  # Brief delay between messages
+
+                    device.sendPosition(
+                        latitude=pos.get('latitude'),
+                        longitude=pos.get('longitude'),
+                        altitude=pos.get('altitude', 0),
+                        destinationId=destination_id
+                    )
+                    self.logger.info(f"Sent position to {node_id}")
+                    return True
+
+            else:
+                self.logger.warning(f"Unknown packet type, cannot send to {node_id}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Failed to send packet to {node_id}: {e}")
+            return False
+
+    def _mark_delivered(self, message_id):
+        """Mark message as delivered with timestamp (but keep for grace period)"""
+        try:
+            now = int(time.time())
+            cursor = self.db.cursor()
+
+            cursor.execute("""
+                UPDATE messages
+                SET delivered = 1, delivered_at = ?
+                WHERE id = ?
+            """, (now, message_id))
+
+            self.db.commit()
+            self.logger.debug(f"Marked message {message_id} as delivered")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to mark message as delivered: {e}")
+
+    def _cleanup_old_messages(self):
+        """
+        Two-tier cleanup strategy:
+        1. Delete delivered messages past grace period (2 hours default)
+        2. Delete undelivered messages past TTL (48 hours default)
+        """
+        try:
+            cursor = self.db.cursor()
+            now = int(time.time())
+
+            # Tier 1: Clean up delivered messages past grace period
+            grace_period_threshold = now - (self.delivered_retention_hours * 3600)
+
+            cursor.execute("""
+                DELETE FROM messages
+                WHERE delivered = 1 AND delivered_at < ?
+            """, (grace_period_threshold,))
+
+            delivered_cleaned = cursor.rowcount
+
+            # Tier 2: Clean up undelivered messages past TTL
+            cursor.execute("""
+                DELETE FROM messages
+                WHERE delivered = 0 AND expires_at < ?
+            """, (now,))
+
+            undelivered_cleaned = cursor.rowcount
+
+            self.db.commit()
+
+            if delivered_cleaned > 0 or undelivered_cleaned > 0:
+                self.logger.info(
+                    f"Cleanup: removed {delivered_cleaned} delivered messages (past grace period), "
+                    f"{undelivered_cleaned} undelivered messages (past TTL)"
+                )
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to cleanup old messages: {e}")
+
+    def _should_track_node(self, node_id):
+        """Check if we should track this node (based on allow list)"""
+        if not node_id:
+            return False
+
+        # If there's an allow list, only track nodes in it
+        if 'to' in self.config and 'allow' in self.config['to']:
+            return node_id in self.config['to']['allow']
+
+        # No allow list = track all nodes
+        return True
+
+    def _should_trigger_delivery(self, packet):
+        """
+        Check if packet should trigger delivery of stored messages
+        Triggers on NODEINFO_APP packets from tracked nodes (natural "I'm online" signal)
+        """
+        if not packet or not isinstance(packet, dict):
+            return False
+
+        # Check if it's a NODEINFO_APP packet
+        if 'decoded' in packet:
+            portnum = packet['decoded'].get('portnum', '')
+            if portnum == 'NODEINFO_APP':
+                return True
+
+        return False
+
+    def do_action(self, packet):
+        """Main packet processing entry point - AGGRESSIVE MODE"""
+        if not packet or not isinstance(packet, dict):
+            return packet
+
+        try:
+            # 1. Update node presence from sender (only if we're tracking this node)
+            from_node = self._extract_node_id(packet, 'from')
+            if from_node and self._should_track_node(from_node):
+                self.logger.debug(f"Node {from_node} seen, updating presence")
+                self._update_node_presence(from_node)
+
+                # Check if this is a NODEINFO packet (node announcing itself / coming online)
+                if self._should_trigger_delivery(packet):
+                    self.logger.info(f"Node {from_node} announced itself (NODEINFO), triggering delivery")
+                    self._deliver_stored_messages(from_node)
+
+            # 2. Store ALL directed messages (AGGRESSIVE MODE)
+            if self._should_store_packet(packet):
+                to_node = self._extract_node_id(packet, 'to')
+                self.logger.info(f"Storing message: {from_node} → {to_node}")
+                self._store_packet(packet)
+
+                # 3. Attempt immediate delivery if destination node was recently seen
+                if to_node and self._is_node_recently_seen(to_node):
+                    self.logger.info(f"Destination {to_node} was recently seen, attempting immediate delivery")
+                    # Try immediate delivery (optimistic)
+                    if self._send_packet_to_node(packet, to_node, from_node, int(time.time())):
+                        self.logger.info(f"Immediate delivery succeeded for {to_node}")
+                    else:
+                        self.logger.warning(f"Immediate delivery failed for {to_node}, will retry later")
+
+            # 4. Periodic cleanup (every 100 packets)
+            self.packet_count += 1
+            if self.packet_count >= 100:
+                self._cleanup_old_messages()
+                self.packet_count = 0
+
+        except Exception as e:
+            self.logger.error(f"Error in do_action: {e}", exc_info=True)
+
+        return packet
+
+
+plugins["store_forward_plugin"] = StoreForwardPlugin()

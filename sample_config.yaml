@@ -3,3 +3,49 @@ devices:
 pipelines:
   - debugger:
       log_level: info
+  # Example: Add timestamp before sending to MQTT
+  # example-with-timestamp:
+  #   - timestamp_plugin:
+  #       format: unix        # Options: unix, unix_ms, iso, iso_local
+  #       field: timestamp    # Optional: customize field name (default: "timestamp")
+  #   - mqtt_plugin:
+  #       name: my_mqtt_server
+  #       topic: meshtastic/messages
+
+  # Example: Store & Forward Plugin (Aggressive Mode)
+  # Stores ALL directed messages and delivers when destination nodes are in range
+  # Perfect for mobile radios that move in/out of range
+  # radio-to-mqtt-with-store-forward:
+  #   - timestamp_plugin:
+  #       format: unix
+  #       field: timestamp
+  #
+  #   # Store & Forward Plugin - Never miss messages!
+  #   - store_forward_plugin:
+  #       # REQUIRED: Path to SQLite database for message storage
+  #       storage_path: /data/store_forward.db
+  #
+  #       # REQUIRED: Device to use for sending stored messages
+  #       device: local
+  #
+  #       # Hours before UNDELIVERED messages expire (default: 48)
+  #       ttl_hours: 48
+  #
+  #       # Hours to keep DELIVERED messages before cleanup (default: 2)
+  #       # Allows retry if initial delivery was marginal
+  #       delivered_retention_hours: 2
+  #
+  #       # Maximum UNDELIVERED messages to store per node (default: 500)
+  #       max_messages_per_node: 500
+  #
+  #       # Minutes without activity before considering node "offline" (default: 30)
+  #       # Used for immediate delivery attempts
+  #       offline_threshold_minutes: 30
+  #
+  #       # Log level: debug, info, warning, error (default: info)
+  #       log_level: info
+  #
+  #   # Continue to MQTT as normal
+  #   - mqtt_plugin:
+  #       name: my_mqtt_server
+  #       topic: meshtastic/messages
