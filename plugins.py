@@ -1054,12 +1054,13 @@ class StoreForwardPlugin(Plugin):
             cursor = self.db.cursor()
 
             # Get all undelivered messages for this node (FIFO order)
+            # Exclude messages the node itself sent (from_node != to_node)
             cursor.execute("""
                 SELECT id, packet_json, from_node, created_at
                 FROM messages
-                WHERE to_node = ? AND delivered = 0
+                WHERE to_node = ? AND delivered = 0 AND from_node != ?
                 ORDER BY created_at ASC
-            """, (node_id,))
+            """, (node_id, node_id))
 
             messages = cursor.fetchall()
 
