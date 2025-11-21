@@ -1305,8 +1305,12 @@ class StoreForwardPlugin(Plugin):
         # Check if it's a NODEINFO_APP packet
         if 'decoded' in packet:
             portnum = packet['decoded'].get('portnum', '')
-            if portnum == 'NODEINFO_APP':
-                return True
+            if portnum == 'TEXT_MESSAGE_APP':
+                text = packet['decoded'].get('text', '').strip().lower()
+                if text == '!get':
+                    return True
+            # if portnum == 'NODEINFO_APP':
+            #     return True
 
         return False
 
