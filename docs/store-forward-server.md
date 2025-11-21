@@ -1,8 +1,25 @@
 # Store & Forward Server Plugin
 
+## Quick Start
+
+**TL;DR:**
+1. Configure the plugin with your node IDs in `to.allow` list
+2. When you come back online, send `!get` command
+3. Receive all missed messages with sender and timestamp
+
+**Example received message:**
+```
+[Stored Message]
+From: !7f0f5719
+Sent: 2025-01-20 22:15:32
+Channel: 0
+---
+Hey, are you there?
+```
+
 ## Overview
 
-The Store & Forward plugin enables the Meshtastic Bridge to act as a message relay server, storing messages destined for nodes that are currently out of range or offline, and automatically delivering them when those nodes return to the network.
+The Store & Forward plugin enables the Meshtastic Bridge to act as a message relay server, storing messages destined for nodes that are currently out of range or offline, and automatically delivering them when those nodes send the `!get` command.
 
 ### Aggressive Mode
 
@@ -31,9 +48,9 @@ With the Store & Forward plugin:
 2. People send replies to you
 3. Bridge receives replies and **stores them in database** ✅
 4. You're out of range, but messages are safely queued
-5. When you return to range and send ANY packet, bridge detects you're online
-6. **All stored messages are automatically delivered to you** ✅
-7. You receive all replies! 🎉
+5. When you return to range, **send `!get` command**
+6. **Bridge delivers all stored messages with metadata** ✅
+7. You receive all replies with sender and timestamp info! 🎉
 
 ## How It Works
 
@@ -43,24 +60,62 @@ With the Store & Forward plugin:
 ┌─────────────────────────────────────────────────────────────┐
 │  1. Message Arrives at Bridge                                │
 │     ↓                                                        │
-│  2. Store in SQLite Database (ALL directed messages)         │
+│  2. Check if Deliverable                                     │
+│     ├─ TEXT_MESSAGE_APP ✓                                    │
+│     └─ Other types (TELEMETRY, NODEINFO, POSITION, etc.) ✗  │
 │     ↓                                                        │
-│  3. Attempt Immediate Delivery                               │
+│  3. Store in SQLite Database                                 │
+│     ├─ Store for each node in allow list (if broadcast)      │
+│     ├─ Don't store messages from bridge itself               │
+│     └─ Apply from/to filters                                 │
+│     ↓                                                        │
+│  4. Attempt Immediate Delivery                               │
 │     ├─ If destination recently seen → Try to send now        │
 │     └─ Keep in queue regardless (may be out of range)        │
 │     ↓                                                        │
-│  4. When Destination Node Sends ANY Packet                   │
+│  5. When Node Sends "!get" Command                           │
 │     ↓                                                        │
-│  5. Bridge Detects Node Online                               │
+│  6. Bridge Triggers Delivery                                 │
 │     ↓                                                        │
-│  6. Deliver ALL Queued Messages (FIFO order)                 │
+│  7. Deliver ALL Queued Messages (FIFO order)                 │
+│     ├─ Exclude messages node itself sent                     │
+│     ├─ Add metadata (from, timestamp, channel)               │
+│     └─ Rate-limited (1 msg/sec)                              │
 │     ↓                                                        │
-│  7. Mark as Delivered (keep for 2hr grace period)            │
+│  8. Mark as Delivered (keep for 2hr grace period)            │
 │     ↓                                                        │
-│  8. Cleanup                                                  │
+│  9. Cleanup                                                  │
 │     ├─ Delivered messages after 2 hours                      │
 │     └─ Undelivered messages after 48 hours                   │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### Command-Based Delivery Trigger
+
+**The `!get` Command:**
+
+To retrieve stored messages, send the text `!get` on your Meshtastic channel:
+
+1. **Type `!get`** in your Meshtastic app (channel message or DM to bridge)
+2. **Send the message** - bridge detects the command
+3. **Bridge delivers** all your stored messages automatically
+4. **Receive messages** with metadata showing sender and timestamp
+
+**Why command-based?**
+- Works with infrastructure nodes (which can't receive DMs)
+- Explicit user control - retrieve messages when you want them
+- Simple and reliable - just send `!get`
+
+**Message Format:**
+
+When you receive stored messages, they include metadata:
+```
+[Stored Message]
+From: !7f0f5719
+Sent: 2025-01-20 22:15:32
+Channel: 0
+---
+Original message content here
 ```
 
 ### Two-Tier Cleanup Strategy
@@ -102,11 +157,7 @@ mqtt_servers:
 
 pipelines:
   radio-to-mqtt:
-    - timestamp_plugin:
-        format: unix
-        field: timestamp
-
-    # Store & Forward Plugin
+    # Store & Forward Plugin (must be before message_filter)
     - store_forward_plugin:
         storage_path: ./data/store_forward.db
         device: t_echo
@@ -115,6 +166,20 @@ pipelines:
         max_messages_per_node: 500
         offline_threshold_minutes: 30
         log_level: info
+        store_broadcasts: true  # Store broadcast messages
+        to:
+          allow:  # Only store messages for these nodes
+            - "1119572084"   # Your mobile radio
+            - "2131711769"   # Another node
+
+    - message_filter:
+        from:
+          disallow:
+            - "!5af47b5e"  # Filter bridge's own messages
+
+    - timestamp_plugin:
+        format: unix
+        field: timestamp
 
     - mqtt_plugin:
         name: external
@@ -237,6 +302,39 @@ Logging verbosity for the plugin.
 - **`warning`**: Message limit exceeded, delivery failures
 - **`error`**: Database errors, configuration errors
 
+#### `store_broadcasts`
+
+**Type:** Boolean
+**Default:** `false`
+**Example:** `store_broadcasts: true`
+
+Enable storage of broadcast/channel messages in addition to direct messages. When enabled, broadcast messages are stored individually for each node in the `to.allow` list.
+
+**Recommendations:**
+- **`true`**: Store both broadcasts and direct messages (comprehensive coverage)
+- **`false`**: Store only direct messages (reduces storage usage)
+
+#### `to.allow`
+
+**Type:** List of strings
+**Required:** No (but highly recommended)
+**Example:**
+```yaml
+to:
+  allow:
+    - "1119572084"
+    - "2131711769"
+```
+
+Whitelist of node IDs to store messages for. Only messages destined for these nodes will be stored and delivered.
+
+**Benefits:**
+- Reduces storage usage by filtering unnecessary messages
+- Focuses on specific mobile nodes that need store & forward
+- Nodes receive only messages from others (not their own)
+
+**Format:** Node IDs as strings (decimal format)
+
 ## Usage Examples
 
 ### Example 1: Basic Setup for Home Base Station
@@ -249,12 +347,22 @@ pipelines:
         device: home_radio
         ttl_hours: 48
         log_level: info
+        store_broadcasts: true
+        to:
+          allow:
+            - "1234567890"  # Your mobile radio
     - mqtt_plugin:
         name: mqtt_broker
         topic: mesh/messages
 ```
 
 **Use Case:** Simple home setup with one mobile radio that checks in daily.
+
+**How to use:**
+1. Leave mobile radio at home (in range)
+2. Go hiking with handheld radio
+3. When you return, send `!get` command from mobile radio
+4. Receive all missed messages with metadata
 
 ### Example 2: High-Volume Network
 
@@ -606,8 +714,8 @@ A: The plugin is designed for radio-to-mqtt pipelines. For mqtt-to-radio, messag
 **Q: What happens if the bridge crashes?**
 A: All stored messages persist in the SQLite database and will be available when the bridge restarts.
 
-**Q: Can I manually trigger message delivery?**
-A: Messages are delivered automatically when the destination node sends any packet. There's no manual trigger command currently.
+**Q: How do I retrieve my stored messages?**
+A: Send `!get` command on your Meshtastic channel. The bridge will detect it and deliver all your stored messages with metadata (sender, timestamp, channel).
 
 **Q: How do I reset/clear all stored messages?**
 A: Delete or rename the database file, then restart the bridge. A new empty database will be created.
@@ -622,6 +730,18 @@ python main.py
 **Q: Does this replace Meshtastic's built-in store & forward?**
 A: No, this is complementary. This works at the bridge level (MQTT/network side), while Meshtastic's built-in S&F works at the device/mesh level.
 
+**Q: Will I receive my own messages back?**
+A: No. The plugin automatically excludes messages you sent when delivering stored messages. You only receive messages from other nodes.
+
+**Q: Does it work with broadcast/channel messages?**
+A: Yes, if you enable `store_broadcasts: true` in the configuration. Broadcast messages are stored individually for each node in your allow list.
+
+**Q: What message types are stored?**
+A: Currently only TEXT_MESSAGE_APP packets are stored and delivered. Position, telemetry, and other packet types are not stored to optimize storage usage.
+
+**Q: Can I filter which nodes to track?**
+A: Yes, use the `to.allow` configuration to specify which nodes should have messages stored. This reduces storage usage and focuses on nodes that need store & forward.
+
 ## Support
 
 For issues, questions, or feature requests:
@@ -629,6 +749,15 @@ For issues, questions, or feature requests:
 - Meshtastic Discord: [discord.gg/meshtastic](https://discord.gg/meshtastic)
 
 ## Version History
+
+- **v1.1** (2025-01): Enhanced filtering and metadata
+  - Command-based delivery trigger (`!get` command)
+  - Message metadata (sender, timestamp, channel)
+  - Exclude own messages from delivery
+  - Only store deliverable packet types (TEXT_MESSAGE_APP)
+  - Broadcast message support with per-node storage
+  - Node filtering with allow/disallow lists
+  - Improved storage efficiency
 
 - **v1.0** (2025-01): Initial aggressive mode implementation
   - Store all directed messages
