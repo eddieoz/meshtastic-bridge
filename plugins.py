@@ -1169,7 +1169,7 @@ class StoreForwardPlugin(Plugin):
                 # Add metadata if this is a stored message
                 if from_node and created_at:
                     from_hex = self._node_id_to_hex(from_node)
-                    to_hex = self._node_id_to_hex(node_id)
+                    to_hex = packet.get('toId') or self._node_id_to_hex(packet.get('to', 0))
                     timestamp_str = self._format_timestamp(created_at)
 
                     # Extract channel (try multiple possible locations)
