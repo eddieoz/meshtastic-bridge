@@ -1169,6 +1169,7 @@ class StoreForwardPlugin(Plugin):
                 # Add metadata if this is a stored message
                 if from_node and created_at:
                     from_hex = self._node_id_to_hex(from_node)
+                    to_hex = self._node_id_to_hex(node_id)
                     timestamp_str = self._format_timestamp(created_at)
 
                     # Extract channel (try multiple possible locations)
@@ -1189,7 +1190,7 @@ class StoreForwardPlugin(Plugin):
                         channel_str = "Channel: Primary"  # Default assumption
 
                     # Format message with metadata
-                    text = f"[Stored Message]\nFrom: {from_hex}\nSent: {timestamp_str}\n{channel_str}\n---\n{original_text}"
+                    text = f"[Stored Message]\nFrom: {from_hex}\nTo: {to_hex}\nSent: {timestamp_str}\n{channel_str}\n---\n{original_text}"
                 else:
                     text = original_text
 
