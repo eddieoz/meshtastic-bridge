@@ -1130,6 +1130,33 @@ class StoreForwardPlugin(Plugin):
         except:
             return str(timestamp)
 
+    def _lookup_sender_by_message_id(self, message_id):
+        """
+        Look up who sent a message by its ID (used for finding reply destinations)
+        Returns the fromId/from of the original message, or None if not found
+        """
+        if not message_id:
+            return None
+
+        try:
+            cursor = self.db.cursor()
+            cursor.execute("""
+                SELECT packet_json FROM messages
+                WHERE packet_json LIKE ?
+                LIMIT 1
+            """, (f'%"id": {message_id}%',))
+
+            result = cursor.fetchone()
+            if result:
+                original_packet = json.loads(result[0])
+                # Return fromId (hex) if available, otherwise convert from
+                return original_packet.get('fromId') or self._node_id_to_hex(original_packet.get('from', 0))
+
+            return None
+        except Exception as e:
+            self.logger.debug(f"Could not lookup message {message_id}: {e}")
+            return None
+
     def _send_packet_to_node(self, packet, node_id, from_node=None, created_at=None):
         """
         Send packet to node via device interface
@@ -1169,9 +1196,25 @@ class StoreForwardPlugin(Plugin):
                 # Add metadata if this is a stored message
                 if from_node and created_at:
                     from_hex = self._node_id_to_hex(from_node)
-                    # Get real destination: check decoded.dest first (app-level), then fall back to network-level
-                    real_dest = decoded.get('dest') or packet.get('to') or 0
-                    to_hex = packet.get('toId') if real_dest == packet.get('to') else self._node_id_to_hex(real_dest)
+
+                    # Determine real destination:
+                    # 1. If this is a reply (has replyId), look up who sent the original message
+                    # 2. Otherwise use toId/to (which may be broadcast ^all)
+                    reply_id = decoded.get('replyId')
+                    if reply_id:
+                        # This is a reply - find the original message sender
+                        self.logger.debug(f"Message is a reply to message ID {reply_id}")
+                        to_hex = self._lookup_sender_by_message_id(reply_id)
+                        if to_hex:
+                            self.logger.debug(f"Found original sender: {to_hex}")
+                        else:
+                            # Couldn't find original message, fall back to toId
+                            self.logger.debug(f"Original message not found, using toId")
+                            to_hex = packet.get('toId') or self._node_id_to_hex(packet.get('to', 0))
+                    else:
+                        # Not a reply, use network-level destination
+                        to_hex = packet.get('toId') or self._node_id_to_hex(packet.get('to', 0))
+
                     timestamp_str = self._format_timestamp(created_at)
 
                     # Extract channel (try multiple possible locations)
@@ -1182,8 +1225,11 @@ class StoreForwardPlugin(Plugin):
                         # Check if it's a channelId field
                         channel = packet.get('channelId', decoded.get('channelId'))
 
-                    # Debug: log packet keys to help identify channel field
+                    # Debug: log packet and decoded keys to help identify fields
                     self.logger.debug(f"Packet keys: {list(packet.keys())}")
+                    self.logger.debug(f"Decoded keys: {list(decoded.keys())}")
+                    self.logger.debug(f"Decoded content: {decoded}")
+                    self.logger.debug(f"Packet 'to': {packet.get('to')}, 'toId': {packet.get('toId')}")
 
                     # Format channel display
                     if channel is not None:
