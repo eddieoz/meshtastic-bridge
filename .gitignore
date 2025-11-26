@@ -4,3 +4,5 @@ data/store_forward.db
 __pycache__/plugins.cpython-311.pyc
 start.sh
 tasks/
+config.yaml
+CLAUDE.md

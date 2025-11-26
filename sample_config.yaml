@@ -1,35 +1,105 @@
+# =============================================================================
+# Meshtastic Bridge - Sample Configuration
+# =============================================================================
+
+# =============================================================================
+# DEVICES - Meshtastic Radio Interfaces
+# =============================================================================
 devices:
+  # Serial connection (auto-detect first available device)
   - name: local
+
+  # Serial connection with specific device path
+  # - name: local_radio
+  #   serial: /dev/ttyACM0
+  #   active: true  # Optional: set to false to disable
+
+  # TCP connection to remote radio
+  # - name: remote_radio
+  #   tcp: 192.168.1.100
+  #   active: true
+
+
+# =============================================================================
+# MQTT SERVERS - External MQTT Broker Connections
+# =============================================================================
+# mqtt_servers:
+#   - name: my_mqtt_broker
+#     server: mqtt.example.com
+#     port: 1883
+#
+#     # Authentication (optional but recommended)
+#     username: mqtt_user
+#     password: mqtt_password
+#
+#     # Client ID (optional)
+#     client_id: meshtastic-bridge-001
+#
+#     # Topic to subscribe to for incoming messages
+#     topic: meshtastic/radio
+#
+#     # TLS/SSL for self-signed certificates (optional)
+#     # insecure: true
+#
+#     # MQTT-to-Radio pipelines (messages from MQTT → Radio)
+#     pipelines:
+#       mqtt-to-radio:
+#         # Send incoming MQTT messages to radio
+#         - radio_message_plugin:
+#             device: local  # Which radio device to send through
+#             to: "^all"     # Broadcast to all radios
+#             log_level: debug
+#
+#             # Advanced: Remap specific node destinations
+#             # node_mapping:
+#             #   "1525971806": "!42bb5074"  # Remap this decimal ID to hex ID
+
+
+# =============================================================================
+# PIPELINES - Radio-to-* Processing
+# =============================================================================
 pipelines:
-  - debugger:
-      log_level: info
-  # Example: Add timestamp before sending to MQTT
-  # example-with-timestamp:
+
+  # ---------------------------------------------------------------------------
+  # Simple Debug Pipeline
+  # ---------------------------------------------------------------------------
+  debug-pipeline:
+    - debugger:
+        log_level: info  # Options: debug, info, warning, error
+
+
+  # ---------------------------------------------------------------------------
+  # Basic Radio-to-MQTT Pipeline
+  # ---------------------------------------------------------------------------
+  # basic-radio-to-mqtt:
+  #   # Add timestamp to packets
   #   - timestamp_plugin:
   #       format: unix        # Options: unix, unix_ms, iso, iso_local
   #       field: timestamp    # Optional: customize field name (default: "timestamp")
+  #
+  #   # Send to MQTT broker
   #   - mqtt_plugin:
-  #       name: my_mqtt_server
+  #       name: my_mqtt_broker
   #       topic: meshtastic/messages
 
-  # Example: Store & Forward Plugin (Aggressive Mode)
-  # Stores ALL directed messages and delivers when destination nodes are in range
+
+  # ---------------------------------------------------------------------------
+  # Advanced Radio-to-MQTT with Store & Forward
+  # ---------------------------------------------------------------------------
+  # Stores ALL directed messages and delivers when destination nodes come online
   # Perfect for mobile radios that move in/out of range
   # radio-to-mqtt-with-store-forward:
-  #   - timestamp_plugin:
-  #       format: unix
-  #       field: timestamp
-  #
-  #   # Store & Forward Plugin - Never miss messages!
+  #   # IMPORTANT: Store & Forward MUST run BEFORE message_filter
+  #   # so it can detect when filtered nodes come online
   #   - store_forward_plugin:
   #       # REQUIRED: Path to SQLite database for message storage
-  #       storage_path: /data/store_forward.db
+  #       storage_path: ./data/store_forward.db
   #
   #       # REQUIRED: Device to use for sending stored messages
   #       device: local
   #
   #       # Hours before UNDELIVERED messages expire (default: 48)
-  #       ttl_hours: 48
+  #       ttl_hours: 12
   #
   #       # Hours to keep DELIVERED messages before cleanup (default: 2)
   #       # Allows retry if initial delivery was marginal
@@ -42,10 +112,157 @@ pipelines:
   #       # Used for immediate delivery attempts
   #       offline_threshold_minutes: 30
   #
+  #       # Store broadcast/channel messages too (default: false)
+  #       store_broadcasts: true
+  #
   #       # Log level: debug, info, warning, error (default: info)
   #       log_level: info
   #
-  #   # Continue to MQTT as normal
+  #       # Filter which nodes to store/forward messages FOR
+  #       to:
+  #         allow:  # Only store messages FOR these destination nodes
+  #           - "1119572084"   # !42bb5074 - your radio
+  #           - "2131711769"   # !7f0f5719 - wife's radio
+  #           - "2071429491"   # !7b778173 - another radio
+  #         # disallow:  # Never store messages TO these nodes
+  #         #   - "!blockednode"
+  #
+  #       # Filter which nodes to store/forward messages FROM
+  #       # from:
+  #       #   allow:  # Only store messages FROM these nodes
+  #       #     - "!trustednode1"
+  #       #   disallow:  # Never store messages FROM these nodes
+  #       #     - "!spamnode"
+  #
+  #   # Filter messages by sender (runs AFTER store_forward)
+  #   - message_filter:
+  #       from:
+  #         disallow:
+  #           - "!5af47b5e"  # Block messages from this node
+  #         # allow:
+  #         #   - "!abc123"  # Only allow messages from these nodes
+  #       # to:  # Filter by destination
+  #       #   allow:
+  #       #     - "^all"
+  #       #   disallow:
+  #       #     - "!blockednode"
+  #
+  #   # Add timestamp
+  #   - timestamp_plugin:
+  #       format: unix
+  #       field: timestamp
+  #
+  #   # Send to MQTT
   #   - mqtt_plugin:
-  #       name: my_mqtt_server
+  #       name: my_mqtt_broker
   #       topic: meshtastic/messages
+
+
+  # ---------------------------------------------------------------------------
+  # Location Filtering Example
+  # ---------------------------------------------------------------------------
+  # location-filter-example:
+  #   - location_filter:
+  #       lat: -23.5505      # Center point latitude
+  #       lng: -46.6333      # Center point longitude
+  #       distance: 100      # Radius in kilometers
+  #       # Packets outside this radius will be dropped
+  #
+  #   - mqtt_plugin:
+  #       name: my_mqtt_broker
+  #       topic: meshtastic/nearby
+
+
+  # ---------------------------------------------------------------------------
+  # Webhook Example
+  # ---------------------------------------------------------------------------
+  # webhook-example:
+  #   - webhook:
+  #       url: https://example.com/webhook
+  #       # headers:  # Optional custom headers
+  #       #   Authorization: Bearer {API_TOKEN}  # Supports env vars with {VAR}
+  #       #   Content-Type: application/json
+  #       # message: "Custom message: {MSG}"  # Optional message template
+  #       log_level: info
+
+
+  # ---------------------------------------------------------------------------
+  # Encryption/Decryption Example
+  # ---------------------------------------------------------------------------
+  # encrypted-pipeline:
+  #   - encrypt_filter:
+  #       key: /path/to/public_key.pem
+  #
+  #   - mqtt_plugin:
+  #       name: my_mqtt_broker
+  #       topic: meshtastic/encrypted
+  #
+  # decrypted-pipeline:
+  #   - decrypt_filter:
+  #       key: /path/to/private_key.pem
+  #
+  #   - mqtt_plugin:
+  #       name: my_mqtt_broker
+  #       topic: meshtastic/decrypted
+
+
+  # ---------------------------------------------------------------------------
+  # Nostr Protocol Example
+  # ---------------------------------------------------------------------------
+  # nostr-example:
+  #   - nostr_plugin:
+  #       private_key: nsec1...     # Or use {NOSTR_PRIVATE_KEY} env var
+  #       public_key: npub1...
+  #       relays:  # Optional additional relays
+  #         - wss://relay.example.com
+  #       log_level: info
+
+
+  # ---------------------------------------------------------------------------
+  # OwnTracks Location Sharing Example
+  # ---------------------------------------------------------------------------
+  # owntracks-example:
+  #   - owntracks_plugin:
+  #       server_name: my_mqtt_broker
+  #       tid_table:
+  #         "!42bb5074": ["user1", "phone"]
+  #         "!7f0f5719": ["user2", "tablet"]
+  #       log_level: info
+
+
+# =============================================================================
+# CONFIGURATION NOTES
+# =============================================================================
+#
+# Plugin Execution Order:
+# - packet_filter always runs first (automatic, normalizes packet format)
+# - Plugins execute in the order they appear in the pipeline
+# - Each plugin can transform, pass through, or drop (return None) packets
+#
+# Node ID Formats:
+# - Decimal: "1119572084"
+# - Hex with !: "!42bb5074"
+# - Special values: "^all" (broadcast), "^local"
+#
+# Environment Variables:
+# - Use {VAR_NAME} syntax in webhook headers and nostr private_key fields
+# - Example: Authorization: Bearer {API_TOKEN}
+#
+# Log Levels:
+# - debug: Verbose output including packet contents
+# - info: Normal operation messages
+# - warning: Important notices
+# - error: Error conditions only
+#
+# Pipeline Types:
+# 1. Top-level pipelines: Process packets from radio devices
+# 2. MQTT server pipelines: Process messages from MQTT brokers
+#
+# Common Use Cases:
+# - Radio ↔ MQTT bridge: Use radio-to-mqtt and mqtt-to-radio pipelines
+# - Store & Forward: Cache messages for offline nodes
+# - Location filtering: Only process packets within a geographic area
+# - Webhooks: Send notifications to external services
+# - Message filtering: Block/allow specific nodes or message types
+#
+# =============================================================================
