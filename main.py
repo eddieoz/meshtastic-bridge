@@ -9,7 +9,7 @@ import time
 from meshtastic import portnums_pb2, mesh_pb2, mqtt_pb2
 from meshtastic.__init__ import LOCAL_ADDR, BROADCAST_NUM, BROADCAST_ADDR
 import os
-from plugins import plugins
+from plugins import plugins, deduplicator
 from pubsub import pub
 import yaml
 from yaml.loader import SafeLoader
@@ -29,6 +29,11 @@ class CustomTCPInterface(meshtastic.tcp_interface.TCPInterface):
 
 
 def onReceive(packet, interface):  # called when a packet arrives
+    # Add packet ID to deduplicator to prevent loops if we receive it back from MQTT
+    if "id" in packet:
+        deduplicator.add(str(packet["id"]))
+        logger.debug(f"Added Packet ID {packet['id']} to deduplication cache")
+
     nodeInfo = interface.getMyNodeInfo()
 
     if bridge_config.get("pipelines"):
@@ -168,6 +173,14 @@ if "mqtt_servers" in bridge_config:
                     logger.debug(f"MQTT {config['name']} (text/json): {orig_packet}")
                 except Exception as e2:
                     logger.error(f"Failed to decode MQTT message as protobuf or text: {e}, {e2}", exc_info=True)
+                except Exception as e2:
+                    logger.error(f"Failed to decode MQTT message as protobuf or text: {e}, {e2}", exc_info=True)
+                    return
+
+            # Check for duplicates using Packet ID
+            if orig_packet and "id" in orig_packet:
+                if deduplicator.is_duplicate(str(orig_packet["id"])):
+                    logger.debug(f"Dropping duplicate message from MQTT (ID: {orig_packet['id']})")
                     return
 
             # Inject raw MQTT data for plugins that need it (like RadioMessagePlugin with mqtt_proxy=True)

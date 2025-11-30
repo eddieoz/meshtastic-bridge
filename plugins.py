@@ -10,7 +10,46 @@ import sqlite3
 import ssl
 import time
 
+import time
+import hashlib
+
 plugins = {}
+
+class Deduplicator:
+    def __init__(self, ttl=60):
+        self.ttl = ttl
+        self.cache = {}
+
+    def add(self, content):
+        # Store hash to save memory
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+        
+        content_hash = hashlib.md5(content).hexdigest()
+        self.cache[content_hash] = time.time()
+        self.cleanup()
+
+    def is_duplicate(self, content):
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+            
+        content_hash = hashlib.md5(content).hexdigest()
+        
+        if content_hash in self.cache:
+            if time.time() - self.cache[content_hash] < self.ttl:
+                return True
+            else:
+                del self.cache[content_hash]
+        return False
+
+    def cleanup(self):
+        current_time = time.time()
+        # Create list of keys to delete to avoid changing dict size during iteration
+        to_delete = [k for k, v in self.cache.items() if current_time - v > self.ttl]
+        for k in to_delete:
+            del self.cache[k]
+
+deduplicator = Deduplicator()
 
 
 class Plugin(object):

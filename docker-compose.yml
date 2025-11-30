@@ -10,6 +10,8 @@ services:
     privileged: true
     volumes:
       - ./config.yaml:/code/config.yaml:ro
+      - ./main.py:/code/main.py:ro
+      - ./plugins.py:/code/plugins.py:ro
       - ./data:/code/data  # Mount data directory for store & forward database
     devices:
       - /dev/ttyACM0:/dev/ttyACM0
