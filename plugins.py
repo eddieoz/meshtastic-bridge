@@ -487,6 +487,41 @@ class RadioMessagePlugin(Plugin):
             self.logger.error(f"Missing interface for device {self.config['device']}")
             return packet
 
+        device_name = self.config["device"]
+        device = self.devices[device_name]
+
+        # MQTT Proxy Logic
+        # Only proxy if it's a protobuf message (binary) that the radio can understand.
+        # If it's JSON or Text, let it fall through to legacy logic which converts it to MeshPacket.
+        if self.config.get("mqtt_proxy") and "_mqtt_topic" in packet and packet.get("_source") == "protobuf":
+            self.logger.debug(f"Proxying MQTT message to Radio {device_name}")
+            
+            try:
+                # Create MqttClientProxyMessage
+                proxy_msg = mesh_pb2.MqttClientProxyMessage()
+                proxy_msg.topic = packet["_mqtt_topic"]
+                proxy_msg.data = packet["_mqtt_payload"]
+                proxy_msg.retained = packet.get("_mqtt_retained", False)
+                # We don't have the 'retained' flag easily available from paho in the current injection 
+                # (unless we add it to main.py too, but defaults are false usually).
+                # Let's check if we can get it. For now, default to False or check if we added it.
+                # We didn't add retained to main.py, so default to False.
+                
+                # Wrap in ToRadio packet
+                to_radio = mesh_pb2.ToRadio()
+                to_radio.mqttClientProxyMessage.CopyFrom(proxy_msg)
+                
+                import logging
+                logging.getLogger("meshtastic.bridge.plugin.send").debug(f"Sending ToRadio: {to_radio}")
+
+                # Send to radio
+                device._sendToRadio(to_radio)
+                self.logger.debug(f"Sent MqttClientProxyMessage to {device_name}")
+                return packet
+            except Exception as e:
+                self.logger.error(f"Failed to proxy MQTT message: {e}", exc_info=True)
+                return packet
+
         destinationId = None
 
         if "to" in self.config:
@@ -503,10 +538,6 @@ class RadioMessagePlugin(Plugin):
         if not destinationId:
             self.logger.error("Missing 'to' property in config or packet")
             return packet
-
-        device_name = self.config["device"]
-
-        device = self.devices[device_name]
 
         # Not a radio packet
         if "decoded" in packet and "text" in packet["decoded"] and "from" not in packet:
@@ -535,6 +566,7 @@ class RadioMessagePlugin(Plugin):
             "decoded" in packet
             and "payload" in packet["decoded"]
             and "portnum" in packet["decoded"]
+            and "from" not in packet
         ):
             meshPacket = mesh_pb2.MeshPacket()
             meshPacket.channel = 0

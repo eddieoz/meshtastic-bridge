@@ -146,16 +146,46 @@ if "mqtt_servers" in bridge_config:
                 # Convert the protobuf packet to dict format
                 from google.protobuf.json_format import MessageToDict
                 orig_packet = MessageToDict(envelope.packet)
+                orig_packet["_source"] = "protobuf"
                 
                 logger.debug(f"MQTT {config['name']} (protobuf): {orig_packet}")
             except Exception as e:
                 # If protobuf fails, try JSON or plain text
                 try:
-                    orig_packet = msg.payload.decode('utf-8')
-                    logger.debug(f"MQTT {config['name']} (text): {orig_packet}")
+                    decoded_payload = msg.payload.decode('utf-8')
+                    try:
+                        import json
+                        orig_packet = json.loads(decoded_payload)
+                        if isinstance(orig_packet, dict):
+                            orig_packet["_source"] = "json"
+                        else:
+                            # If JSON is just a string or number, treat as text
+                            orig_packet = decoded_payload
+                            # We don't set _source here, handled below
+                    except Exception:
+                        orig_packet = decoded_payload
+                    
+                    logger.debug(f"MQTT {config['name']} (text/json): {orig_packet}")
                 except Exception as e2:
                     logger.error(f"Failed to decode MQTT message as protobuf or text: {e}, {e2}", exc_info=True)
                     return
+
+            # Inject raw MQTT data for plugins that need it (like RadioMessagePlugin with mqtt_proxy=True)
+            if isinstance(orig_packet, dict):
+                orig_packet["_mqtt_topic"] = msg.topic
+                orig_packet["_mqtt_payload"] = msg.payload
+                orig_packet["_mqtt_retained"] = msg.retain
+                if "_source" not in orig_packet:
+                    orig_packet["_source"] = "dict" # Fallback
+            elif isinstance(orig_packet, str):
+                # Convert to a dict structure to be safe and consistent
+                orig_packet = {
+                    "decoded": {"text": orig_packet},
+                    "_mqtt_topic": msg.topic,
+                    "_mqtt_payload": msg.payload,
+                    "_mqtt_retained": msg.retain,
+                    "_source": "text"
+                }
 
             if not config.get("pipelines"):
                 logger.warning(f"MQTT {config['name']}: no pipeline")
