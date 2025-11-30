@@ -502,17 +502,12 @@ class RadioMessagePlugin(Plugin):
                 proxy_msg.topic = packet["_mqtt_topic"]
                 proxy_msg.data = packet["_mqtt_payload"]
                 proxy_msg.retained = packet.get("_mqtt_retained", False)
-                # We don't have the 'retained' flag easily available from paho in the current injection 
-                # (unless we add it to main.py too, but defaults are false usually).
-                # Let's check if we can get it. For now, default to False or check if we added it.
-                # We didn't add retained to main.py, so default to False.
                 
                 # Wrap in ToRadio packet
                 to_radio = mesh_pb2.ToRadio()
                 to_radio.mqttClientProxyMessage.CopyFrom(proxy_msg)
                 
-                import logging
-                logging.getLogger("meshtastic.bridge.plugin.send").debug(f"Sending ToRadio: {to_radio}")
+                self.logger.debug(f"Sending ToRadio: {to_radio}")
 
                 # Send to radio
                 device._sendToRadio(to_radio)
