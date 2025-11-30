@@ -18,7 +18,7 @@ class Plugin(object):
         self.logger.setLevel(logging.INFO)
 
     def configure(self, devices, mqtt_servers, config):
-        self.config = config
+        self.config = config or {}
         self.devices = devices
         self.mqtt_servers = mqtt_servers
 

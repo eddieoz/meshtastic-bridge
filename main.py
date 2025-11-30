@@ -31,7 +31,7 @@ class CustomTCPInterface(meshtastic.tcp_interface.TCPInterface):
 def onReceive(packet, interface):  # called when a packet arrives
     nodeInfo = interface.getMyNodeInfo()
 
-    if "pipelines" in bridge_config:
+    if bridge_config.get("pipelines"):
         for pipeline, pipeline_plugins in bridge_config["pipelines"].items():
             logger.debug(f"Pipeline {pipeline} initiated")
 
@@ -139,7 +139,7 @@ if "mqtt_servers" in bridge_config:
 
             logger.debug(f"MQTT {config['name']}: {orig_packet}")
 
-            if "pipelines" not in config:
+            if not config.get("pipelines"):
                 logger.warning(f"MQTT {config['name']}: no pipeline")
                 return
 
