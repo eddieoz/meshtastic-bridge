@@ -8,3 +8,4 @@ config.yaml
 CLAUDE.md
 GEMINI.md
 __pycache__/
+reference/

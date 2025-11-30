@@ -6,7 +6,7 @@ import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from haversine import haversine
 import time
-from meshtastic import portnums_pb2, mesh_pb2
+from meshtastic import portnums_pb2, mesh_pb2, mqtt_pb2
 from meshtastic.__init__ import LOCAL_ADDR, BROADCAST_NUM, BROADCAST_ADDR
 import os
 from plugins import plugins
@@ -135,9 +135,27 @@ if "mqtt_servers" in bridge_config:
             logger.debug(f"Connected to MQTT {config['name']}")
 
         def on_message(mqttc, obj, msg):
-            orig_packet = msg.payload.decode()
-
-            logger.debug(f"MQTT {config['name']}: {orig_packet}")
+            # Try to decode the message - could be protobuf or JSON
+            orig_packet = None
+            
+            # Try protobuf ServiceEnvelope first (binary format)
+            try:
+                envelope = mqtt_pb2.ServiceEnvelope()
+                envelope.ParseFromString(msg.payload)
+                
+                # Convert the protobuf packet to dict format
+                from google.protobuf.json_format import MessageToDict
+                orig_packet = MessageToDict(envelope.packet)
+                
+                logger.debug(f"MQTT {config['name']} (protobuf): {orig_packet}")
+            except Exception as e:
+                # If protobuf fails, try JSON or plain text
+                try:
+                    orig_packet = msg.payload.decode('utf-8')
+                    logger.debug(f"MQTT {config['name']} (text): {orig_packet}")
+                except Exception as e2:
+                    logger.error(f"Failed to decode MQTT message as protobuf or text: {e}, {e2}", exc_info=True)
+                    return
 
             if not config.get("pipelines"):
                 logger.warning(f"MQTT {config['name']}: no pipeline")
