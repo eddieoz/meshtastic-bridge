@@ -26,7 +26,7 @@ def main():
         
         # 3. Create MqttClientProxyMessage
         proxy_msg = mesh_pb2.MqttClientProxyMessage()
-        proxy_msg.topic = "mc/2/e/LongFast" # Standard topic without node ID
+        proxy_msg.topic = "mc/2/e/MiHome" # Testing Primary Channel
         proxy_msg.data = payload_bytes
         proxy_msg.retained = False
         
